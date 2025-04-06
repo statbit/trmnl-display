@@ -557,6 +557,8 @@ func saveConfig(configDir string, config Config) {
 	err = os.WriteFile(configFile, data, 0600)
 	if err != nil {
 		fmt.Printf("Error writing config file: %v\n", err)
+	} else {
+		fmt.Printf("Config saved to %s\n", configFile)
 	}
 }
 
