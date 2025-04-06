@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"image"
 	"image/color"
-	"image/draw"
 	_ "image/jpeg" // Register JPEG decoder
 	_ "image/png"  // Register PNG decoder
 	"io"
@@ -17,17 +16,15 @@ import (
 	"os/signal"
 	"os/user"
 	"path/filepath"
-	"strconv"
-	"strings"
 	"syscall"
 	"time"
 	"unsafe"
 
+	"golang.org/x/sys/unix"
+
 	_ "golang.org/x/image/bmp" // Register BMP decoder
 
 	imagedraw "golang.org/x/image/draw"
-
-	"github.com/gonutz/framebuffer"
 )
 
 // Version information
@@ -55,19 +52,19 @@ type AppOptions struct {
 	Verbose  bool
 }
 
-// FramebufferLock represents the lock file structure
-type FramebufferLock struct {
+// DisplayLock represents the lock file structure
+type DisplayLock struct {
 	LockPath string
 	Acquired bool
 }
 
 // Global lock variable for cleanup
-var fbLock *FramebufferLock
+var displayLock *DisplayLock
 
 // Add this new function to disable the cursor
 func disableCursor() error {
 	// Method 1: Using the terminal settings
-	termios := syscall.Termios{
+	termios := unix.Termios{
 		Iflag: 0,
 		Oflag: 0,
 		Cflag: 0,
@@ -80,7 +77,7 @@ func disableCursor() error {
 	}
 	defer tty.Close()
 
-	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, tty.Fd(), uintptr(syscall.TCSETS), uintptr(unsafe.Pointer(&termios)))
+	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, tty.Fd(), uintptr(unix.TIOCSETA), uintptr(unsafe.Pointer(&termios)))
 	if errno != 0 {
 		return fmt.Errorf("ioctl error: %v", errno)
 	}
@@ -137,8 +134,6 @@ func main() {
 		if options.DarkMode {
 			fmt.Println("Dark mode enabled - 1-bit BMP images will be inverted")
 		}
-		checkDisplayServer()
-		listFramebufferDevices()
 	}
 
 	// Create a configuration directory
@@ -176,192 +171,24 @@ func main() {
 	}
 	defer os.RemoveAll(tmpDir)
 
-	// Create and acquire framebuffer lock
-	fbLock = NewFramebufferLock("/var/lock/trmnl-display.lock")
-	err = fbLock.Acquire()
+	// Initialize the E-Ink display
+	epd, err := NewEPD()
 	if err != nil {
-		fmt.Printf("Error acquiring framebuffer lock: %v\n", err)
+		fmt.Printf("Error initializing E-Ink display: %v\n", err)
 		os.Exit(1)
 	}
-	defer fbLock.Release()
+	defer epd.Close()
 
-	// Disable cursor
-	if err := disableCursor(); err != nil {
-		fmt.Printf("Warning: Failed to disable cursor: %v\n", err)
-		// Continue anyway, as this is not critical
-	}
-
-	// Clear the framebuffer at startup
-	clearFramebuffer()
+	// Initialize the display
+	epd.Init()
+	epd.Clear()
 
 	for {
-		processNextImage(tmpDir, config.APIKey, options)
+		processNextImage(tmpDir, config.APIKey, options, epd)
 	}
 }
 
-// NewFramebufferLock creates a new framebuffer lock
-func NewFramebufferLock(lockPath string) *FramebufferLock {
-	return &FramebufferLock{
-		LockPath: lockPath,
-		Acquired: false,
-	}
-}
-
-// Acquire attempts to acquire the framebuffer lock
-func (l *FramebufferLock) Acquire() error {
-	// First check if the lock file exists
-	if _, err := os.Stat(l.LockPath); err == nil {
-		// Lock file exists, check if it's stale
-		pid, err := l.readLockFile()
-		if err != nil {
-			return fmt.Errorf("error reading lock file: %v", err)
-		}
-
-		// Check if the process is still running
-		if l.isProcessRunning(pid) {
-			return fmt.Errorf("framebuffer is currently in use by process %d", pid)
-		}
-
-		// Lock is stale, remove it
-		fmt.Printf("Removing stale lock from PID %d\n", pid)
-		if err := os.Remove(l.LockPath); err != nil {
-			return fmt.Errorf("error removing stale lock file: %v", err)
-		}
-	}
-
-	// Create the lock file with current PID
-	if err := l.writeLockFile(); err != nil {
-		return fmt.Errorf("error creating lock file: %v", err)
-	}
-
-	l.Acquired = true
-	fmt.Println("Acquired exclusive framebuffer access")
-	return nil
-}
-
-// Release releases the framebuffer lock
-func (l *FramebufferLock) Release() {
-	if l.Acquired {
-		if err := os.Remove(l.LockPath); err != nil {
-			fmt.Printf("Error removing lock file: %v\n", err)
-		} else {
-			fmt.Println("Released framebuffer lock")
-			l.Acquired = false
-		}
-	}
-}
-
-// readLockFile reads the PID from the lock file
-func (l *FramebufferLock) readLockFile() (int, error) {
-	data, err := os.ReadFile(l.LockPath)
-	if err != nil {
-		return 0, err
-	}
-
-	pidStr := strings.TrimSpace(string(data))
-	pid, err := strconv.Atoi(pidStr)
-	if err != nil {
-		return 0, fmt.Errorf("invalid PID in lock file: %v", err)
-	}
-
-	return pid, nil
-}
-
-// writeLockFile writes the current PID to the lock file
-func (l *FramebufferLock) writeLockFile() error {
-	pid := os.Getpid()
-	return os.WriteFile(l.LockPath, []byte(fmt.Sprintf("%d", pid)), 0644)
-}
-
-// isProcessRunning checks if a process with the given PID is running
-func (l *FramebufferLock) isProcessRunning(pid int) bool {
-	// Try to find the process
-	process, err := os.FindProcess(pid)
-	if err != nil {
-		return false // Can't find process, must not be running
-	}
-
-	// On Unix, FindProcess always succeeds, so we need to send a signal
-	// to check if the process actually exists
-	err = process.Signal(syscall.Signal(0))
-	return err == nil
-}
-
-// setupSignalHandling sets up handlers for SIGINT, SIGTERM, and SIGHUP
-func setupSignalHandling() {
-	c := make(chan os.Signal, 1)
-	signal.Notify(c, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
-	go func() {
-		<-c
-		fmt.Println("\nReceived termination signal. Cleaning up...")
-		if fbLock != nil {
-			fbLock.Release()
-		}
-		clearFramebuffer()
-		restoreCursor() // Restore cursor before exiting
-		os.Exit(0)
-	}()
-}
-
-// clearFramebuffer fills the framebuffer with black to clear it
-func clearFramebuffer() {
-	fmt.Println("Clearing framebuffer...")
-
-	fb, err := framebuffer.Open("/dev/fb0")
-	if err != nil {
-		fmt.Printf("Error opening framebuffer to clear: %v\n", err)
-		return
-	}
-	defer fb.Close()
-
-	// Create a black image
-	black := image.NewRGBA(fb.Bounds())
-	draw.Draw(fb, fb.Bounds(), black, image.Point{}, draw.Src)
-
-	// Flush the framebuffer if necessary
-	if fbFlusher, ok := interface{}(fb).(interface{ Flush() error }); ok {
-		fbFlusher.Flush()
-	}
-}
-
-// checkRoot verifies if the program is running with root privileges
-func checkRoot() {
-	currentUser, err := user.Current()
-	if err != nil {
-		fmt.Printf("Error determining current user: %v\n", err)
-		os.Exit(1)
-	}
-
-	if currentUser.Uid != "0" {
-		fmt.Println("This program requires root privileges to access the framebuffer.")
-		fmt.Println("Please run with sudo or as root.")
-		os.Exit(1)
-	}
-
-	fmt.Println("Running with root privileges ✓")
-}
-
-// parseCommandLineArgs parses command line arguments and returns app options
-func parseCommandLineArgs() AppOptions {
-	darkMode := flag.Bool("d", false, "Enable dark mode (invert 1-bit BMP images)")
-	showVersion := flag.Bool("v", false, "Show version information")
-	verbose := flag.Bool("verbose", true, "Enable verbose output")
-	quiet := flag.Bool("q", false, "Quiet mode (disable verbose output)")
-	flag.Parse()
-
-	if *showVersion {
-		fmt.Printf("trmnl-display version %s (commit: %s, built: %s)\n",
-			version, commit, buildDate)
-		os.Exit(0)
-	}
-
-	return AppOptions{
-		DarkMode: *darkMode,
-		Verbose:  *verbose && !*quiet,
-	}
-}
-
-func processNextImage(tmpDir, apiKey string, options AppOptions) {
+func processNextImage(tmpDir, apiKey string, options AppOptions, epd *EPD) {
 	// Use defer and recover to handle any panics
 	defer func() {
 		if r := recover(); r != nil {
@@ -443,7 +270,7 @@ func processNextImage(tmpDir, apiKey string, options AppOptions) {
 	out.Close()
 
 	// Display the image
-	err = displayImage(filePath, options)
+	err = displayImage(filePath, options, epd)
 	if err != nil {
 		fmt.Printf("Error displaying image: %v\n", err)
 		time.Sleep(60 * time.Second)
@@ -460,7 +287,7 @@ func processNextImage(tmpDir, apiKey string, options AppOptions) {
 	time.Sleep(time.Duration(refreshRate) * time.Second)
 }
 
-func displayImage(imagePath string, options AppOptions) error {
+func displayImage(imagePath string, options AppOptions, epd *EPD) error {
 	// Open the image file
 	file, err := os.Open(imagePath)
 	if err != nil {
@@ -507,45 +334,17 @@ func displayImage(imagePath string, options AppOptions) error {
 		fmt.Printf("Successfully decoded image as %s\n", format)
 	}
 
-	// Verify we still have the lock before proceeding
-	if fbLock != nil && !fbLock.Acquired {
-		return fmt.Errorf("lost framebuffer lock, cannot continue")
-	}
+	// Scale the image to match the display dimensions
+	scaledImg := image.NewRGBA(image.Rect(0, 0, epd.width, epd.height))
+	imagedraw.NearestNeighbor.Scale(scaledImg, scaledImg.Bounds(), img, img.Bounds(), imagedraw.Over, nil)
 
-	// Switch to tty1 so the framebuffer becomes active
-	err = exec.Command("chvt", "1").Run()
-	if err != nil {
-		fmt.Printf("Error switching VT to tty1: %v\n", err)
-	}
-
-	// Open the framebuffer
-	fb, err := framebuffer.Open("/dev/fb0")
-	if err != nil {
-		return fmt.Errorf("error opening framebuffer: %v", err)
-	}
-	defer fb.Close()
-
-	// Get framebuffer bounds
-	fbBounds := fb.Bounds()
-	if options.Verbose {
-		fmt.Printf("Framebuffer bounds: %v\n", fbBounds)
-	}
-
-	// Scale the image to fill the entire framebuffer
-	targetRect := fbBounds
-	scaledImg := image.NewRGBA(targetRect)
-	imagedraw.NearestNeighbor.Scale(scaledImg, targetRect, img, img.Bounds(), imagedraw.Over, nil)
-
-	// Draw the scaled image to the framebuffer
-	draw.Draw(fb, targetRect, scaledImg, image.Point{}, draw.Src)
-
-	// Flush the framebuffer if necessary
-	if fbFlusher, ok := interface{}(fb).(interface{ Flush() error }); ok {
-		fbFlusher.Flush()
+	// Display the image
+	if err := epd.DisplayImage(scaledImg); err != nil {
+		return fmt.Errorf("error displaying image on E-Ink display: %v", err)
 	}
 
 	if options.Verbose {
-		fmt.Println("Image drawing completed (full screen)")
+		fmt.Println("Image drawing completed")
 	}
 	return nil
 }
@@ -777,18 +576,51 @@ func saveConfig(configDir string, config Config) {
 	}
 }
 
-// checkDisplayServer is a placeholder for checking if a display server is running.
-func checkDisplayServer() {
-	// Add code here to check for X server, Wayland, etc., if needed.
-	fmt.Println("Display server check not implemented, assuming framebuffer usage")
+// checkRoot verifies if the program is running with root privileges
+func checkRoot() {
+	currentUser, err := user.Current()
+	if err != nil {
+		fmt.Printf("Error determining current user: %v\n", err)
+		os.Exit(1)
+	}
+
+	if currentUser.Uid != "0" {
+		fmt.Println("This program requires root privileges to access the framebuffer.")
+		fmt.Println("Please run with sudo or as root.")
+		os.Exit(1)
+	}
+
+	fmt.Println("Running with root privileges ✓")
 }
 
-// listFramebufferDevices lists available framebuffer devices.
-func listFramebufferDevices() {
-	files, err := filepath.Glob("/dev/fb*")
-	if err != nil {
-		fmt.Printf("Error listing framebuffer devices: %v\n", err)
-		return
+// parseCommandLineArgs parses command line arguments and returns app options
+func parseCommandLineArgs() AppOptions {
+	darkMode := flag.Bool("d", false, "Enable dark mode (invert 1-bit BMP images)")
+	showVersion := flag.Bool("v", false, "Show version information")
+	verbose := flag.Bool("verbose", true, "Enable verbose output")
+	quiet := flag.Bool("q", false, "Quiet mode (disable verbose output)")
+	flag.Parse()
+
+	if *showVersion {
+		fmt.Printf("trmnl-display version %s (commit: %s, built: %s)\n",
+			version, commit, buildDate)
+		os.Exit(0)
 	}
-	fmt.Printf("Found framebuffer devices: %v\n", files)
+
+	return AppOptions{
+		DarkMode: *darkMode,
+		Verbose:  *verbose && !*quiet,
+	}
+}
+
+// setupSignalHandling sets up handlers for SIGINT, SIGTERM, and SIGHUP
+func setupSignalHandling() {
+	c := make(chan os.Signal, 1)
+	signal.Notify(c, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
+	go func() {
+		<-c
+		fmt.Println("\nReceived termination signal. Cleaning up...")
+		restoreCursor() // Restore cursor before exiting
+		os.Exit(0)
+	}()
 }
