@@ -155,6 +155,8 @@ func main() {
 	}
 	defer os.RemoveAll(tmpDir)
 
+	fmt.Printf("Using API Key: %s\n", config.APIKey)
+	fmt.Printf("Using config directory: %s\n", configDir)
 	// Initialize the E-Ink display
 	epd, err := NewEPD()
 	if err != nil {
